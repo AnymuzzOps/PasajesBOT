@@ -461,6 +461,14 @@ def main() -> None:
             prices_found += 1
             item["route_label"] = label_map.get((origin, dest), label)
 
+            log.info(
+                "  💺 CLP %s | Aerolínea: %s | Fuente: %s | Fecha: %s",
+                f"{price:,}",
+                item.get("airline", "?"),
+                item.get("source", "?"),
+                item.get("queried_depart", "?"),
+            )
+
             # Actualizar historial ANTES de evaluar (para no contaminar)
             stats_before = get_stats(history, origin, dest)
             update_history(history, origin, dest, price)

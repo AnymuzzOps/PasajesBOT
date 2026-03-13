@@ -48,7 +48,12 @@ ROUTES = [
     # ── Internacionales ─────────────────────────────────────────────────────────
     ("SCL", "LIM", "Santiago → Lima"),
     ("SCL", "BOG", "Santiago → Bogotá"),
-    ("SCL", "GRU", "Santiago → São Paulo"),
+    ("SCL", "GRU", "Santiago → São Paulo (Guarulhos)"),
+    ("SCL", "CGH", "Santiago → São Paulo (Congonhas)"),
+    ("SCL", "GIG", "Santiago → Río de Janeiro"),
+    ("SCL", "BSB", "Santiago → Brasilia"),
+    ("SCL", "FOR", "Santiago → Fortaleza"),
+    ("SCL", "SSA", "Santiago → Salvador"),
     ("SCL", "EZE", "Santiago → Buenos Aires"),
     ("SCL", "MIA", "Santiago → Miami"),
     ("SCL", "MAD", "Santiago → Madrid"),

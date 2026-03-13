@@ -1,0 +1,60 @@
+name: ✈️ Flight Price Monitor
+
+on:
+  schedule:
+    # Corre 3 veces al día: 7am, 12pm y 8pm hora Chile (UTC-3)
+    - cron: "0 10,15,23 * * *"
+  workflow_dispatch:
+    inputs:
+      send_summary:
+        description: "Enviar resumen aunque no haya alertas"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # ── Caché del historial de precios entre ejecuciones ──────────────────
+      - name: 💾 Restaurar historial de precios
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: price-history-${{ runner.os }}-${{ hashFiles('data/price_history.json') }}
+          restore-keys: |
+            price-history-${{ runner.os }}-
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 📦 Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: 🛫 Ejecutar monitoreo
+        env:
+          TELEGRAM_TOKEN:        ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
+          AVIASALES_TOKEN:       ${{ secrets.AVIASALES_TOKEN }}
+          SERPAPI_KEY:           ${{ secrets.SERPAPI_KEY }}
+          ANOMALY_THRESHOLD_PCT: "35"
+          SEND_SUMMARY:          ${{ github.event.inputs.send_summary || 'false' }}
+        run: python flight_monitor.py
+
+      # ── Persistir historial actualizado ───────────────────────────────────
+      - name: 💾 Guardar historial actualizado
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: data/
+          key: price-history-${{ runner.os }}-${{ github.run_id }}

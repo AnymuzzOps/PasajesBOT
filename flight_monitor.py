@@ -27,8 +27,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")   # opcional
 DATA_FILE        = Path("data/price_history.json")
 
@@ -80,6 +80,22 @@ def make_session() -> requests.Session:
     return s
 
 SESSION = make_session()
+
+
+def validate_config() -> bool:
+    """
+    Verifica variables críticas para evitar fallos por KeyError al iniciar.
+    """
+    missing = []
+    if not TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+
+    if missing:
+        log.error("Faltan variables de entorno requeridas: %s", ", ".join(missing))
+        return False
+    return True
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  FUENTES DE PRECIOS
@@ -239,9 +255,12 @@ def load_history() -> dict:
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     if DATA_FILE.exists():
         try:
-            return json.loads(DATA_FILE.read_text())
+            data = json.loads(DATA_FILE.read_text())
+            if isinstance(data, dict):
+                return data
+            log.warning("%s no tiene estructura dict válida; se reinicia historial.", DATA_FILE)
         except Exception:
-            pass
+            log.warning("No se pudo leer %s; se reinicia historial.", DATA_FILE)
     return {}
 
 
@@ -257,7 +276,10 @@ def update_history(history: dict, origin: str, dest: str, price: int) -> None:
     key = route_key(origin, dest)
     if key not in history:
         history[key] = {"prices": [], "updated": ""}
-    history[key]["prices"].append(price)
+    prices = history[key]["prices"]
+    # Evita ruido por duplicados consecutivos en una misma ruta.
+    if not prices or prices[-1] != price:
+        prices.append(price)
     # Mantener solo los últimos 60 registros
     history[key]["prices"] = history[key]["prices"][-60:]
     history[key]["updated"] = datetime.now().isoformat()
@@ -325,7 +347,7 @@ def groq_analyze(price: int, stats: dict, route_label: str, depart: str) -> str:
     )
 
     try:
-        r = requests.post(
+        r = SESSION.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -444,9 +466,12 @@ ALERTS_FILE = Path("data/sent_alerts.json")
 def load_sent_alerts() -> set:
     if ALERTS_FILE.exists():
         try:
-            return set(json.loads(ALERTS_FILE.read_text()))
+            data = json.loads(ALERTS_FILE.read_text())
+            if isinstance(data, list):
+                return set(data)
+            log.warning("%s no tiene formato lista válido; se reinicia deduplicación.", ALERTS_FILE)
         except Exception:
-            pass
+            log.warning("No se pudo leer %s; se reinicia deduplicación.", ALERTS_FILE)
     return set()
 
 
@@ -465,6 +490,9 @@ def alert_id(item: dict) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
+    if not validate_config():
+        return
+
     log.info("🛫 Iniciando monitoreo de vuelos desde SCL")
 
     history     = load_history()

@@ -60,12 +60,8 @@ ROUTES = [
     ("SCL", "CUN", "Santiago → Cancún"),
 ]
 
-# Fechas a consultar: próximas N semanas
-WEEKS_AHEAD = 16
-
-# Días de la semana a consultar por cada semana (0=lunes, 1=martes, 2=miércoles)
-# Martes y miércoles suelen tener los precios más bajos
-DAYS_TO_CHECK = [0, 1, 2]  # lunes, martes, miércoles
+# Fechas a consultar: próximas N semanas (lunes de cada semana)
+WEEKS_AHEAD = 8
 
 # ── HTTP session con reintentos ────────────────────────────────────────────────
 def make_session() -> requests.Session:
@@ -125,49 +121,6 @@ def search_aviasales(origin: str, dest: str, depart: str) -> list[dict]:
         return results
     except Exception as e:
         log.warning("Aviasales error %s→%s: %s", origin, dest, e)
-        return []
-
-
-def search_aviasales_monthly(origin: str, dest: str, month: str) -> list[dict]:
-    """
-    Endpoint de precios mínimos por mes de Aviasales.
-    Devuelve el precio más bajo de TODO el mes, sin importar el día exacto.
-    Complementa a search_aviasales para no perder ofertas puntuales.
-    """
-    token = os.environ.get("AVIASALES_TOKEN", "")
-    if not token:
-        return []
-
-    url = "https://api.travelpayouts.com/v2/prices/month-matrix"
-    params = {
-        "origin":      origin,
-        "destination": dest,
-        "month":       month,  # YYYY-MM
-        "currency":    "CLP",
-        "token":       token,
-        "show_to_affiliates": "true",
-    }
-    try:
-        r = SESSION.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json().get("data", [])
-        results = []
-        for day in data:
-            price = day.get("price", 0)
-            if price > 0:
-                depart_date = day.get("depart_date", month)
-                results.append({
-                    "price":   price,
-                    "airline": day.get("airline", "?"),
-                    "depart":  depart_date,
-                    "link":    f"https://www.aviasales.com/search/{origin}{depart_date.replace('-','')}{dest}1",
-                    "source":  "aviasales_monthly",
-                })
-        # Ordenar por precio y devolver los 5 más baratos del mes
-        results.sort(key=lambda x: x["price"])
-        return results[:5]
-    except Exception as e:
-        log.warning("Aviasales monthly error %s→%s: %s", origin, dest, e)
         return []
 
 
@@ -248,61 +201,34 @@ def search_kayak_scrape(origin: str, dest: str, depart: str) -> list[dict]:
 def fetch_prices(origin: str, dest: str) -> list[dict]:
     """
     Agrega precios de todas las fuentes disponibles para las próximas semanas.
-    Consulta lunes, martes y miércoles de cada semana + mínimos mensuales.
     """
     all_prices = []
     today = datetime.today()
-    seen_months = set()  # para no repetir consultas mensuales
 
     for week in range(1, WEEKS_AHEAD + 1):
-        week_base = today + timedelta(weeks=week)
-        # Ir al lunes de esa semana
-        week_base -= timedelta(days=week_base.weekday())
+        depart_dt = today + timedelta(weeks=week)
+        # Redondea al próximo lunes
+        depart_dt += timedelta(days=(7 - depart_dt.weekday()) % 7)
+        depart_str = depart_dt.strftime("%Y-%m-%d")
+        month_str  = depart_dt.strftime("%Y-%m")
 
-        for day_offset in DAYS_TO_CHECK:
-            depart_dt  = week_base + timedelta(days=day_offset)
-            depart_str = depart_dt.strftime("%Y-%m-%d")
-            month_str  = depart_dt.strftime("%Y-%m")
+        found = []
+        found += search_aviasales(origin, dest, month_str)
+        if not found:
+            found += search_google_flights_serpapi(origin, dest, depart_str)
+        if not found:
+            found += search_kayak_scrape(origin, dest, depart_str)
 
-            # Consulta mensual (solo una vez por mes)
-            if month_str not in seen_months:
-                seen_months.add(month_str)
-                monthly = search_aviasales_monthly(origin, dest, month_str)
-                for item in monthly:
-                    if item.get("price", 0) > 0:
-                        item["origin"] = origin
-                        item["dest"]   = dest
-                        item["queried_depart"] = item.get("depart", depart_str)
-                        all_prices.append(item)
-                time.sleep(random.uniform(1.0, 2.0))
+        for item in found:
+            if item.get("price", 0) > 0:
+                item["origin"] = origin
+                item["dest"]   = dest
+                item["queried_depart"] = depart_str
+                all_prices.append(item)
 
-            # Consulta por fecha específica
-            found = []
-            found += search_aviasales(origin, dest, month_str)
-            if not found:
-                found += search_google_flights_serpapi(origin, dest, depart_str)
-            if not found:
-                found += search_kayak_scrape(origin, dest, depart_str)
+        time.sleep(random.uniform(1.5, 3.5))  # cortesía
 
-            for item in found:
-                if item.get("price", 0) > 0:
-                    item["origin"] = origin
-                    item["dest"]   = dest
-                    item["queried_depart"] = depart_str
-                    all_prices.append(item)
-
-            time.sleep(random.uniform(1.5, 3.0))  # cortesía
-
-    # Deduplicar por (precio, fecha) para no procesar duplicados
-    seen = set()
-    unique = []
-    for item in all_prices:
-        key = (item["price"], item.get("queried_depart", ""), item.get("airline", ""))
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-
-    return unique
+    return all_prices
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -472,16 +398,40 @@ def format_alert(item: dict, stats: dict, pct_below: float, ai_comment: str) -> 
     return "\n".join(lines)
 
 
-def format_summary(alerts_sent: int, routes_checked: int, prices_found: int) -> str:
+def format_summary(
+    alerts_sent: int,
+    routes_checked: int,
+    prices_found: int,
+    best_deals: list[dict],
+    routes_without_data: list[str],
+) -> str:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    status = "✅ Sin anomalías" if alerts_sent == 0 else f"🚨 {alerts_sent} alerta(s) enviada(s)"
-    return (
-        f"📋 <b>Resumen del monitoreo</b>\n"
-        f"🕐 {now} (hora Chile)\n"
-        f"🛫 Rutas revisadas: {routes_checked}\n"
-        f"💲 Precios recopilados: {prices_found}\n"
-        f"Estado: {status}"
-    )
+    status = "✅ Sin anomalías detectadas" if alerts_sent == 0 else f"🚨 {alerts_sent} alerta(s) enviada(s)"
+
+    lines = [
+        f"📋 <b>Resumen del monitoreo</b>",
+        f"🕐 {now} (hora Chile)",
+        f"🛫 Rutas revisadas: {routes_checked}",
+        f"💲 Precios recopilados: {prices_found}",
+        f"Estado: {status}",
+        f"",
+    ]
+
+    # Top 5 precios más baratos encontrados hoy
+    if best_deals:
+        lines.append(f"🏷 <b>Mejores precios de hoy:</b>")
+        for d in best_deals[:5]:
+            pct_str = f" (-{d['pct']:.0f}%)" if d.get("pct") else ""
+            lines.append(
+                f"  • {d['label']}: <b>CLP {d['price']:,}</b>{pct_str} — {d['depart']}"
+            )
+        lines.append("")
+
+    # Rutas sin datos (posible problema de cobertura)
+    if routes_without_data:
+        lines.append(f"⚠️ Sin datos: {', '.join(routes_without_data)}")
+
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -520,17 +470,21 @@ def main() -> None:
     history     = load_history()
     sent_alerts = load_sent_alerts()
 
-    alerts_sent  = 0
-    prices_found = 0
+    alerts_sent        = 0
+    prices_found       = 0
+    best_deals         = []   # top precios del día para el resumen
+    routes_without_data = []  # rutas sin resultados
 
-    # Construir mapa de label por ruta
     label_map = {(o, d): lbl for o, d, lbl in ROUTES}
 
     for origin, dest, label in ROUTES:
-        log.info("Consultando %s…", label)
+        log.info("Consultando %s...", label)
 
         prices = fetch_prices(origin, dest)
-        log.info("  → %d precio(s) encontrado(s)", len(prices))
+        log.info("  -> %d precio(s) encontrado(s)", len(prices))
+
+        if not prices:
+            routes_without_data.append(label.split("→")[-1].strip())
 
         for item in prices:
             price = item["price"]
@@ -541,22 +495,37 @@ def main() -> None:
             item["route_label"] = label_map.get((origin, dest), label)
 
             log.info(
-                "  💺 CLP %s | Aerolínea: %s | Fuente: %s | Fecha: %s",
+                "  CLP %s | Aerolinea: %s | Fuente: %s | Fecha: %s",
                 f"{price:,}",
                 item.get("airline", "?"),
                 item.get("source", "?"),
                 item.get("queried_depart", "?"),
             )
 
-            # Actualizar historial ANTES de evaluar (para no contaminar)
             stats_before = get_stats(history, origin, dest)
             update_history(history, origin, dest, price)
 
             if stats_before is None:
                 log.info("  Acumulando historial para %s (precio: %s)", label, price)
+                # Igual guardamos para el resumen aunque no tengamos historial
+                best_deals.append({
+                    "label":  label,
+                    "price":  price,
+                    "depart": item.get("queried_depart", "?"),
+                    "pct":    None,
+                })
                 continue
 
             anomaly, pct = is_anomaly(price, stats_before)
+
+            # Guardar para resumen (todos los precios, no solo anomalías)
+            best_deals.append({
+                "label":  label,
+                "price":  price,
+                "depart": item.get("queried_depart", "?"),
+                "pct":    pct if pct > 0 else None,
+            })
+
             if not anomaly:
                 log.info("  Precio normal: CLP %s (%.0f%% bajo media)", price, pct)
                 continue
@@ -566,27 +535,37 @@ def main() -> None:
                 log.info("  Alerta ya enviada antes (%s), omitiendo.", aid)
                 continue
 
-            log.info("  🚨 ANOMALÍA detectada! CLP %s (%.0f%% bajo media)", price, pct)
+            log.info("  ANOMALIA detectada! CLP %s (%.0f%% bajo media)", price, pct)
 
-            # Análisis con IA (opcional)
             ai_comment = groq_analyze(price, stats_before, label, item.get("queried_depart", ""))
 
             msg = format_alert(item, stats_before, pct, ai_comment)
             if send_telegram(msg):
                 sent_alerts.add(aid)
                 alerts_sent += 1
-                time.sleep(2)  # pausa entre mensajes
+                time.sleep(2)
 
-    # Guardar estado
     save_history(history)
     save_sent_alerts(sent_alerts)
 
-    # Resumen final (solo en ejecución manual o si hubo alertas)
-    send_summary = os.environ.get("SEND_SUMMARY", "false").lower() == "true"
-    if send_summary or alerts_sent > 0:
-        send_telegram(format_summary(alerts_sent, len(ROUTES), prices_found))
+    # Ordenar best_deals por precio ascendente y deduplicar por ruta
+    seen_labels = set()
+    unique_deals = []
+    for d in sorted(best_deals, key=lambda x: x["price"]):
+        if d["label"] not in seen_labels:
+            seen_labels.add(d["label"])
+            unique_deals.append(d)
 
-    log.info("✅ Monitoreo completo. Alertas enviadas: %d", alerts_sent)
+    # Resumen siempre se envía (3 veces al día = info útil)
+    send_telegram(format_summary(
+        alerts_sent,
+        len(ROUTES),
+        prices_found,
+        unique_deals,
+        routes_without_data,
+    ))
+
+    log.info("Monitoreo completo. Alertas enviadas: %d", alerts_sent)
 
 
 if __name__ == "__main__":

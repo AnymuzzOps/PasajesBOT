@@ -34,6 +34,7 @@ DATA_FILE        = Path("data/price_history.json")
 
 # Umbral: alerta si el precio es X% menor al promedio histórico
 ANOMALY_THRESHOLD_PCT = float(os.environ.get("ANOMALY_THRESHOLD_PCT", "35"))
+REAL_DEAL_THRESHOLD_PCT = float(os.environ.get("REAL_DEAL_THRESHOLD_PCT", "60"))
 MIN_PRICE_CLP = 10_000
 # Fechas alternativas (días desde el lunes objetivo) para mejorar cobertura por ruta
 DATE_OFFSETS_DAYS = [0, 2, 4]
@@ -99,6 +100,25 @@ def validate_config() -> bool:
         log.error("Faltan variables de entorno requeridas: %s", ", ".join(missing))
         return False
     return True
+
+
+AIRLINE_NAMES = {
+    "LA": "LATAM Airlines",
+    "JA": "SKY Airline",
+    "H2": "JetSMART",
+    "JZ": "JetSMART",
+    "AR": "Aerolíneas Argentinas",
+    "IB": "Iberia",
+    "G3": "GOL",
+}
+
+
+def airline_display_name(airline: str) -> str:
+    code = (airline or "?").strip()
+    if not code:
+        return "Desconocida"
+    return AIRLINE_NAMES.get(code[:2], code)
+
 
 def candidate_depart_dates(base_monday: datetime) -> list[str]:
     """
@@ -330,22 +350,14 @@ def get_stats(history: dict, origin: str, dest: str) -> dict | None:
 def is_anomaly(price: int, stats: dict) -> tuple[bool, float]:
     """
     Retorna (es_anomalía, pct_descuento).
-    Usa media y desviación estándar (z-score) + umbral porcentual.
+    Para reducir falsos positivos, se alerta solo con descuento "real".
     """
-    mean  = stats["mean"]
-    stdev = stats["stdev"]
-
+    mean = stats["mean"]
     pct_below = (mean - price) / mean * 100
 
-    # Criterio 1: precio X% por debajo del promedio
-    if pct_below >= ANOMALY_THRESHOLD_PCT:
+    # Filtro de descuento real (configurable, recomendado 60% para alertas muy agresivas)
+    if pct_below >= REAL_DEAL_THRESHOLD_PCT:
         return True, pct_below
-
-    # Criterio 2: z-score ≥ 2.5 (precio estadísticamente muy bajo)
-    if stdev > 0:
-        z = (mean - price) / stdev
-        if z >= 2.5:
-            return True, pct_below
 
     return False, pct_below
 
@@ -416,13 +428,14 @@ def send_telegram(message: str) -> bool:
 
 def format_alert(item: dict, stats: dict, pct_below: float, ai_comment: str) -> str:
     airline = item.get("airline", "?")
+    airline_name = airline_display_name(airline)
     airline_emoji = {"JA": "🟡", "LA": "🔴", "H2": "🟠", "JZ": "🟣"}.get(airline[:2], "✈️")
 
     lines = [
         f"🚨 <b>ALERTA DE PRECIO ANÓMALO</b> 🚨",
         f"",
         f"{airline_emoji} <b>{item.get('route_label', item['origin'] + ' → ' + item['dest'])}</b>",
-        f"🛩 Aerolínea: <b>{airline}</b>",
+        f"🛩 Aerolínea: <b>{airline_name}</b> ({airline})",
         f"📅 Salida: <b>{item.get('queried_depart', item.get('depart', '?'))}</b>",
         f"",
         f"💰 Precio: <b>CLP {item['price']:,}</b>",

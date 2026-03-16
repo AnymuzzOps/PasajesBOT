@@ -35,6 +35,8 @@ DATA_FILE        = Path("data/price_history.json")
 # Umbral: alerta si el precio es X% menor al promedio histórico
 ANOMALY_THRESHOLD_PCT = float(os.environ.get("ANOMALY_THRESHOLD_PCT", "35"))
 MIN_PRICE_CLP = 10_000
+# Fechas alternativas (días desde el lunes objetivo) para mejorar cobertura por ruta
+DATE_OFFSETS_DAYS = [0, 2, 4]
 
 # Rutas a monitorear: (origen, destino, label)
 ROUTES = [
@@ -97,6 +99,17 @@ def validate_config() -> bool:
         log.error("Faltan variables de entorno requeridas: %s", ", ".join(missing))
         return False
     return True
+
+def candidate_depart_dates(base_monday: datetime) -> list[str]:
+    """
+    Genera fechas de salida alternativas por semana para aumentar cobertura.
+    """
+    dates = []
+    for days in DATE_OFFSETS_DAYS:
+        dt = base_monday + timedelta(days=days)
+        dates.append(dt.strftime("%Y-%m-%d"))
+    return dates
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  FUENTES DE PRECIOS
@@ -218,6 +231,7 @@ def search_kayak_scrape(origin: str, dest: str, depart: str) -> list[dict]:
 def fetch_prices(origin: str, dest: str) -> list[dict]:
     """
     Agrega precios de todas las fuentes disponibles para las próximas semanas.
+    Si no hay datos para el lunes, prueba fechas alternativas de la misma semana.
     """
     all_prices = []
     today = datetime.today()
@@ -226,23 +240,32 @@ def fetch_prices(origin: str, dest: str) -> list[dict]:
         depart_dt = today + timedelta(weeks=week)
         # Redondea al próximo lunes
         depart_dt += timedelta(days=(7 - depart_dt.weekday()) % 7)
-        depart_str = depart_dt.strftime("%Y-%m-%d")
-        month_str  = depart_dt.strftime("%Y-%m")
 
-        found = []
-        found += search_aviasales(origin, dest, month_str)
-        if not found:
-            found += search_google_flights_serpapi(origin, dest, depart_str)
-        if not found:
-            found += search_kayak_scrape(origin, dest, depart_str)
+        found_week = []
+        for depart_str in candidate_depart_dates(depart_dt):
+            month_str = depart_str[:7]
 
-        for item in found:
-            if item.get("price", 0) >= MIN_PRICE_CLP:
-                item["origin"] = origin
-                item["dest"]   = dest
-                item["queried_depart"] = depart_str
-                all_prices.append(item)
+            found = []
+            found += search_aviasales(origin, dest, month_str)
+            if not found:
+                found += search_google_flights_serpapi(origin, dest, depart_str)
+            if not found:
+                found += search_kayak_scrape(origin, dest, depart_str)
 
+            for item in found:
+                if item.get("price", 0) >= MIN_PRICE_CLP:
+                    item["origin"] = origin
+                    item["dest"] = dest
+                    item["queried_depart"] = depart_str
+                    found_week.append(item)
+
+            # Si ya encontramos precios para esta semana, evitamos gastar más cuota/API.
+            if found_week:
+                break
+
+            time.sleep(random.uniform(1.0, 2.0))
+
+        all_prices.extend(found_week)
         time.sleep(random.uniform(1.5, 3.5))  # cortesía
 
     return all_prices

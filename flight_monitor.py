@@ -38,6 +38,7 @@ REAL_DEAL_THRESHOLD_PCT = float(os.environ.get("REAL_DEAL_THRESHOLD_PCT", "60"))
 MIN_PRICE_CLP = 10_000
 # Fechas alternativas (días desde el lunes objetivo) para mejorar cobertura por ruta
 DATE_OFFSETS_DAYS = [0, 2, 4]
+INTERNATIONAL_DATE_OFFSETS_DAYS = [0, 1, 2, 3, 4, 5, 6]
 
 # Rutas a monitorear: (origen, destino, label)
 ROUTES = [
@@ -63,6 +64,10 @@ ROUTES = [
     ("SCL", "MAD", "Santiago → Madrid"),
     ("SCL", "CUN", "Santiago → Cancún"),
 ]
+
+DOMESTIC_DESTS = {
+    "IQQ", "ARI", "ANF", "CCP", "PMC", "PUQ", "LSC",
+}
 
 # Fechas a consultar: próximas N semanas (lunes de cada semana)
 WEEKS_AHEAD = 8
@@ -120,12 +125,14 @@ def airline_display_name(airline: str) -> str:
     return AIRLINE_NAMES.get(code[:2], code)
 
 
-def candidate_depart_dates(base_monday: datetime) -> list[str]:
+def candidate_depart_dates(base_monday: datetime, dest: str) -> list[str]:
     """
     Genera fechas de salida alternativas por semana para aumentar cobertura.
+    Para rutas internacionales, recorre toda la semana.
     """
+    offsets = DATE_OFFSETS_DAYS if dest in DOMESTIC_DESTS else INTERNATIONAL_DATE_OFFSETS_DAYS
     dates = []
-    for days in DATE_OFFSETS_DAYS:
+    for days in offsets:
         dt = base_monday + timedelta(days=days)
         dates.append(dt.strftime("%Y-%m-%d"))
     return dates
@@ -262,14 +269,20 @@ def fetch_prices(origin: str, dest: str) -> list[dict]:
         depart_dt += timedelta(days=(7 - depart_dt.weekday()) % 7)
 
         found_week = []
-        for depart_str in candidate_depart_dates(depart_dt):
+        for depart_str in candidate_depart_dates(depart_dt, dest):
             month_str = depart_str[:7]
 
             found = []
             found += search_aviasales(origin, dest, month_str)
-            if not found:
-                found += search_google_flights_serpapi(origin, dest, depart_str)
-            if not found:
+            valid_found = [i for i in found if i.get("price", 0) >= MIN_PRICE_CLP]
+
+            # Fallback por resultado válido (no solo por respuesta no vacía).
+            if not valid_found:
+                serp = search_google_flights_serpapi(origin, dest, depart_str)
+                found += serp
+                valid_found = [i for i in found if i.get("price", 0) >= MIN_PRICE_CLP]
+
+            if not valid_found:
                 found += search_kayak_scrape(origin, dest, depart_str)
 
             for item in found:

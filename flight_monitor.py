@@ -34,6 +34,7 @@ DATA_FILE        = Path("data/price_history.json")
 
 # Umbral: alerta si el precio es X% menor al promedio histórico
 ANOMALY_THRESHOLD_PCT = float(os.environ.get("ANOMALY_THRESHOLD_PCT", "35"))
+MIN_PRICE_CLP = 10_000
 
 # Rutas a monitorear: (origen, destino, label)
 ROUTES = [
@@ -236,7 +237,7 @@ def fetch_prices(origin: str, dest: str) -> list[dict]:
             found += search_kayak_scrape(origin, dest, depart_str)
 
         for item in found:
-            if item.get("price", 0) > 0:
+            if item.get("price", 0) >= MIN_PRICE_CLP:
                 item["origin"] = origin
                 item["dest"]   = dest
                 item["queried_depart"] = depart_str
@@ -391,14 +392,14 @@ def send_telegram(message: str) -> bool:
 
 
 def format_alert(item: dict, stats: dict, pct_below: float, ai_comment: str) -> str:
-    airline_emoji = {
-        "JA": "🟡", "LA": "🔴", "H2": "🟠",   # Sky, LATAM, JetSMART
-    }.get(item.get("airline", "")[:2], "✈️")
+    airline = item.get("airline", "?")
+    airline_emoji = {"JA": "🟡", "LA": "🔴", "H2": "🟠", "JZ": "🟣"}.get(airline[:2], "✈️")
 
     lines = [
         f"🚨 <b>ALERTA DE PRECIO ANÓMALO</b> 🚨",
         f"",
         f"{airline_emoji} <b>{item.get('route_label', item['origin'] + ' → ' + item['dest'])}</b>",
+        f"🛩 Aerolínea: <b>{airline}</b>",
         f"📅 Salida: <b>{item.get('queried_depart', item.get('depart', '?'))}</b>",
         f"",
         f"💰 Precio: <b>CLP {item['price']:,}</b>",

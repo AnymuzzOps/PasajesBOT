@@ -27,13 +27,19 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")   # opcional
 DATA_FILE        = Path("data/price_history.json")
 
 # Umbral: alerta si el precio es X% menor al promedio histórico
 ANOMALY_THRESHOLD_PCT = float(os.environ.get("ANOMALY_THRESHOLD_PCT", "35"))
+REAL_DEAL_THRESHOLD_PCT = float(os.environ.get("REAL_DEAL_THRESHOLD_PCT", "60"))
+INTERNATIONAL_REAL_DEAL_THRESHOLD_PCT = float(os.environ.get("INTERNATIONAL_REAL_DEAL_THRESHOLD_PCT", "45"))
+MIN_PRICE_CLP = 10_000
+# Fechas alternativas (días desde el lunes objetivo) para mejorar cobertura por ruta
+DATE_OFFSETS_DAYS = [0, 2, 4]
+INTERNATIONAL_DATE_OFFSETS_DAYS = [0, 1, 2, 3, 4, 5, 6]
 
 # Rutas a monitorear: (origen, destino, label)
 ROUTES = [
@@ -60,6 +66,17 @@ ROUTES = [
     ("SCL", "CUN", "Santiago → Cancún"),
 ]
 
+DOMESTIC_DESTS = {
+    "IQQ", "ARI", "ANF", "CCP", "PMC", "PUQ", "LSC",
+}
+
+DEST_ALIASES = {
+    "GRU": ["SAO"],
+    "CGH": ["SAO"],
+    "GIG": ["RIO"],
+    "EZE": ["BUE", "AEP"],
+}
+
 # Fechas a consultar: próximas N semanas (lunes de cada semana)
 WEEKS_AHEAD = 8
 
@@ -81,6 +98,68 @@ def make_session() -> requests.Session:
 
 SESSION = make_session()
 
+
+def validate_config() -> bool:
+    """
+    Verifica variables críticas para evitar fallos por KeyError al iniciar.
+    """
+    missing = []
+    if not TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+
+    if missing:
+        log.error("Faltan variables de entorno requeridas: %s", ", ".join(missing))
+        return False
+    return True
+
+
+AIRLINE_NAMES = {
+    "LA": "LATAM Airlines",
+    "JA": "SKY Airline",
+    "H2": "JetSMART",
+    "JZ": "JetSMART",
+    "AR": "Aerolíneas Argentinas",
+    "IB": "Iberia",
+    "G3": "GOL",
+}
+
+
+def airline_display_name(airline: str) -> str:
+    code = (airline or "?").strip()
+    if not code:
+        return "Desconocida"
+    return AIRLINE_NAMES.get(code[:2], code)
+
+
+def destination_candidates(dest: str) -> list[str]:
+    """
+    Devuelve códigos alternativos de destino para mejorar cobertura internacional.
+    """
+    return [dest, *DEST_ALIASES.get(dest, [])]
+
+
+def stop_after_first_week_hit(dest: str) -> bool:
+    """
+    En vuelos domésticos basta con un hallazgo semanal; internacionales siguen buscando más opciones.
+    """
+    return dest in DOMESTIC_DESTS
+
+
+def candidate_depart_dates(base_monday: datetime, dest: str) -> list[str]:
+    """
+    Genera fechas de salida alternativas por semana para aumentar cobertura.
+    Para rutas internacionales, recorre toda la semana.
+    """
+    offsets = DATE_OFFSETS_DAYS if dest in DOMESTIC_DESTS else INTERNATIONAL_DATE_OFFSETS_DAYS
+    dates = []
+    for days in offsets:
+        dt = base_monday + timedelta(days=days)
+        dates.append(dt.strftime("%Y-%m-%d"))
+    return dates
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  FUENTES DE PRECIOS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -96,32 +175,34 @@ def search_aviasales(origin: str, dest: str, depart: str) -> list[dict]:
         return []
 
     url = "https://api.travelpayouts.com/v1/prices/cheap"
-    params = {
-        "origin":       origin,
-        "destination":  dest,
-        "depart_date":  depart,  # YYYY-MM
-        "currency":     "CLP",
-        "token":        token,
-        "limit":        5,
-    }
-    try:
-        r = SESSION.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json().get("data", {}).get(dest, {})
-        results = []
-        for flight in data.values():
-            results.append({
-                "price":    flight.get("price", 0),
-                "airline":  flight.get("airline", "?"),
-                "depart":   flight.get("departure_at", ""),
-                "return":   flight.get("return_at", ""),
-                "link":     f"https://www.aviasales.com/search/{origin}{depart.replace('-','')}{dest}1",
-                "source":   "aviasales",
-            })
-        return results
-    except Exception as e:
-        log.warning("Aviasales error %s→%s: %s", origin, dest, e)
-        return []
+    for candidate_dest in destination_candidates(dest):
+        params = {
+            "origin":       origin,
+            "destination":  candidate_dest,
+            "depart_date":  depart,  # YYYY-MM
+            "currency":     "CLP",
+            "token":        token,
+            "limit":        5,
+        }
+        try:
+            r = SESSION.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json().get("data", {}).get(candidate_dest, {})
+            results = []
+            for flight in data.values():
+                results.append({
+                    "price":    flight.get("price", 0),
+                    "airline":  flight.get("airline", "?"),
+                    "depart":   flight.get("departure_at", ""),
+                    "return":   flight.get("return_at", ""),
+                    "link":     f"https://www.aviasales.com/search/{origin}{depart.replace('-', '')}{candidate_dest}1",
+                    "source":   "aviasales",
+                })
+            if results:
+                return results
+        except Exception as e:
+            log.warning("Aviasales error %s→%s: %s", origin, candidate_dest, e)
+    return []
 
 
 def search_google_flights_serpapi(origin: str, dest: str, depart: str) -> list[dict]:
@@ -134,33 +215,35 @@ def search_google_flights_serpapi(origin: str, dest: str, depart: str) -> list[d
         return []
 
     url = "https://serpapi.com/search"
-    params = {
-        "engine":           "google_flights",
-        "departure_id":     origin,
-        "arrival_id":       dest,
-        "outbound_date":    depart,
-        "currency":         "CLP",
-        "hl":               "es",
-        "api_key":          api_key,
-        "type":             "2",  # solo ida
-    }
-    try:
-        r = SESSION.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        best = r.json().get("best_flights", [])
-        results = []
-        for f in best[:3]:
-            results.append({
-                "price":   f.get("price", 0),
-                "airline": f["flights"][0].get("airline", "?") if f.get("flights") else "?",
-                "depart":  depart,
-                "link":    f"https://www.google.com/flights?hl=es#flt={origin}.{dest}.{depart}",
-                "source":  "google_flights",
-            })
-        return results
-    except Exception as e:
-        log.warning("SerpAPI error %s→%s: %s", origin, dest, e)
-        return []
+    for arrival_id in destination_candidates(dest):
+        params = {
+            "engine":           "google_flights",
+            "departure_id":     origin,
+            "arrival_id":       arrival_id,
+            "outbound_date":    depart,
+            "currency":         "CLP",
+            "hl":               "es",
+            "api_key":          api_key,
+            "type":             "2",  # solo ida
+        }
+        try:
+            r = SESSION.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            best = r.json().get("best_flights", [])
+            results = []
+            for f in best[:3]:
+                results.append({
+                    "price":   f.get("price", 0),
+                    "airline": f["flights"][0].get("airline", "?") if f.get("flights") else "?",
+                    "depart":  depart,
+                    "link":    f"https://www.google.com/flights?hl=es#flt={origin}.{arrival_id}.{depart}",
+                    "source":  "google_flights",
+                })
+            if results:
+                return results
+        except Exception as e:
+            log.warning("SerpAPI error %s→%s: %s", origin, arrival_id, e)
+    return []
 
 
 def search_kayak_scrape(origin: str, dest: str, depart: str) -> list[dict]:
@@ -168,39 +251,40 @@ def search_kayak_scrape(origin: str, dest: str, depart: str) -> list[dict]:
     Scraping liviano de la API pública de Kayak (no oficial, usar con respeto).
     Solo se usa si las APIs anteriores no devuelven resultados.
     """
-    # Kayak usa una URL de exploración con JSON embebido
-    url = (
-        f"https://www.kayak.cl/flights/{origin}-{dest}"
-        f"/{depart}?sort=price_a"
-    )
     headers = {
         "User-Agent": SESSION.headers["User-Agent"],
         "Accept": "text/html,application/xhtml+xml",
     }
-    try:
-        r = SESSION.get(url, headers=headers, timeout=15)
-        # Extracción básica: busca patrones de precio en el HTML
-        import re
-        prices = re.findall(r'"amount":(\d+)', r.text)
-        if not prices:
-            prices = re.findall(r'CLP\s*([\d\.]+)', r.text)
-        if prices:
-            p = int(prices[0].replace(".", ""))
-            return [{
-                "price":   p,
-                "airline": "Varios",
-                "depart":  depart,
-                "link":    url,
-                "source":  "kayak",
-            }]
-    except Exception as e:
-        log.warning("Kayak scrape error %s→%s: %s", origin, dest, e)
+    import re
+
+    for arrival_id in destination_candidates(dest):
+        url = (
+            f"https://www.kayak.cl/flights/{origin}-{arrival_id}"
+            f"/{depart}?sort=price_a"
+        )
+        try:
+            r = SESSION.get(url, headers=headers, timeout=15)
+            prices = re.findall(r'"amount":(\d+)', r.text)
+            if not prices:
+                prices = re.findall(r'CLP\s*([\d\.]+)', r.text)
+            if prices:
+                p = int(prices[0].replace(".", ""))
+                return [{
+                    "price":   p,
+                    "airline": "Varios",
+                    "depart":  depart,
+                    "link":    url,
+                    "source":  "kayak",
+                }]
+        except Exception as e:
+            log.warning("Kayak scrape error %s→%s: %s", origin, arrival_id, e)
     return []
 
 
 def fetch_prices(origin: str, dest: str) -> list[dict]:
     """
     Agrega precios de todas las fuentes disponibles para las próximas semanas.
+    Si no hay datos para el lunes, prueba fechas alternativas de la misma semana.
     """
     all_prices = []
     today = datetime.today()
@@ -209,23 +293,38 @@ def fetch_prices(origin: str, dest: str) -> list[dict]:
         depart_dt = today + timedelta(weeks=week)
         # Redondea al próximo lunes
         depart_dt += timedelta(days=(7 - depart_dt.weekday()) % 7)
-        depart_str = depart_dt.strftime("%Y-%m-%d")
-        month_str  = depart_dt.strftime("%Y-%m")
 
-        found = []
-        found += search_aviasales(origin, dest, month_str)
-        if not found:
-            found += search_google_flights_serpapi(origin, dest, depart_str)
-        if not found:
-            found += search_kayak_scrape(origin, dest, depart_str)
+        found_week = []
+        for depart_str in candidate_depart_dates(depart_dt, dest):
+            month_str = depart_str[:7]
 
-        for item in found:
-            if item.get("price", 0) > 0:
-                item["origin"] = origin
-                item["dest"]   = dest
-                item["queried_depart"] = depart_str
-                all_prices.append(item)
+            found = []
+            found += search_aviasales(origin, dest, month_str)
+            valid_found = [i for i in found if i.get("price", 0) >= MIN_PRICE_CLP]
 
+            # Fallback por resultado válido (no solo por respuesta no vacía).
+            if not valid_found:
+                serp = search_google_flights_serpapi(origin, dest, depart_str)
+                found += serp
+                valid_found = [i for i in found if i.get("price", 0) >= MIN_PRICE_CLP]
+
+            if not valid_found:
+                found += search_kayak_scrape(origin, dest, depart_str)
+
+            for item in found:
+                if item.get("price", 0) >= MIN_PRICE_CLP:
+                    item["origin"] = origin
+                    item["dest"] = dest
+                    item["queried_depart"] = depart_str
+                    found_week.append(item)
+
+            # En rutas domésticas basta un resultado semanal; internacionales siguen buscando más cobertura.
+            if found_week and stop_after_first_week_hit(dest):
+                break
+
+            time.sleep(random.uniform(1.0, 2.0))
+
+        all_prices.extend(found_week)
         time.sleep(random.uniform(1.5, 3.5))  # cortesía
 
     return all_prices
@@ -239,9 +338,12 @@ def load_history() -> dict:
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     if DATA_FILE.exists():
         try:
-            return json.loads(DATA_FILE.read_text())
+            data = json.loads(DATA_FILE.read_text())
+            if isinstance(data, dict):
+                return data
+            log.warning("%s no tiene estructura dict válida; se reinicia historial.", DATA_FILE)
         except Exception:
-            pass
+            log.warning("No se pudo leer %s; se reinicia historial.", DATA_FILE)
     return {}
 
 
@@ -257,7 +359,10 @@ def update_history(history: dict, origin: str, dest: str, price: int) -> None:
     key = route_key(origin, dest)
     if key not in history:
         history[key] = {"prices": [], "updated": ""}
-    history[key]["prices"].append(price)
+    prices = history[key]["prices"]
+    # Evita ruido por duplicados consecutivos en una misma ruta.
+    if not prices or prices[-1] != price:
+        prices.append(price)
     # Mantener solo los últimos 60 registros
     history[key]["prices"] = history[key]["prices"][-60:]
     history[key]["updated"] = datetime.now().isoformat()
@@ -281,25 +386,17 @@ def get_stats(history: dict, origin: str, dest: str) -> dict | None:
 # 3.  DETECCIÓN DE ANOMALÍAS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def is_anomaly(price: int, stats: dict) -> tuple[bool, float]:
+def is_anomaly(price: int, stats: dict, dest: str) -> tuple[bool, float]:
     """
     Retorna (es_anomalía, pct_descuento).
-    Usa media y desviación estándar (z-score) + umbral porcentual.
+    Usa umbrales distintos para rutas domésticas e internacionales.
     """
-    mean  = stats["mean"]
-    stdev = stats["stdev"]
-
+    mean = stats["mean"]
     pct_below = (mean - price) / mean * 100
+    threshold = REAL_DEAL_THRESHOLD_PCT if dest in DOMESTIC_DESTS else INTERNATIONAL_REAL_DEAL_THRESHOLD_PCT
 
-    # Criterio 1: precio X% por debajo del promedio
-    if pct_below >= ANOMALY_THRESHOLD_PCT:
+    if pct_below >= threshold:
         return True, pct_below
-
-    # Criterio 2: z-score ≥ 2.5 (precio estadísticamente muy bajo)
-    if stdev > 0:
-        z = (mean - price) / stdev
-        if z >= 2.5:
-            return True, pct_below
 
     return False, pct_below
 
@@ -325,7 +422,7 @@ def groq_analyze(price: int, stats: dict, route_label: str, depart: str) -> str:
     )
 
     try:
-        r = requests.post(
+        r = SESSION.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -369,14 +466,15 @@ def send_telegram(message: str) -> bool:
 
 
 def format_alert(item: dict, stats: dict, pct_below: float, ai_comment: str) -> str:
-    airline_emoji = {
-        "JA": "🟡", "LA": "🔴", "H2": "🟠",   # Sky, LATAM, JetSMART
-    }.get(item.get("airline", "")[:2], "✈️")
+    airline = item.get("airline", "?")
+    airline_name = airline_display_name(airline)
+    airline_emoji = {"JA": "🟡", "LA": "🔴", "H2": "🟠", "JZ": "🟣"}.get(airline[:2], "✈️")
 
     lines = [
         f"🚨 <b>ALERTA DE PRECIO ANÓMALO</b> 🚨",
         f"",
         f"{airline_emoji} <b>{item.get('route_label', item['origin'] + ' → ' + item['dest'])}</b>",
+        f"🛩 Aerolínea: <b>{airline_name}</b> ({airline})",
         f"📅 Salida: <b>{item.get('queried_depart', item.get('depart', '?'))}</b>",
         f"",
         f"💰 Precio: <b>CLP {item['price']:,}</b>",
@@ -444,9 +542,12 @@ ALERTS_FILE = Path("data/sent_alerts.json")
 def load_sent_alerts() -> set:
     if ALERTS_FILE.exists():
         try:
-            return set(json.loads(ALERTS_FILE.read_text()))
+            data = json.loads(ALERTS_FILE.read_text())
+            if isinstance(data, list):
+                return set(data)
+            log.warning("%s no tiene formato lista válido; se reinicia deduplicación.", ALERTS_FILE)
         except Exception:
-            pass
+            log.warning("No se pudo leer %s; se reinicia deduplicación.", ALERTS_FILE)
     return set()
 
 
@@ -465,6 +566,9 @@ def alert_id(item: dict) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
+    if not validate_config():
+        return
+
     log.info("🛫 Iniciando monitoreo de vuelos desde SCL")
 
     history     = load_history()
@@ -516,7 +620,7 @@ def main() -> None:
                 })
                 continue
 
-            anomaly, pct = is_anomaly(price, stats_before)
+            anomaly, pct = is_anomaly(price, stats_before, dest)
 
             # Guardar para resumen (todos los precios, no solo anomalías)
             best_deals.append({

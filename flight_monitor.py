@@ -75,7 +75,6 @@ DEST_ALIASES = {
     "CGH": ["SAO"],
     "GIG": ["RIO"],
     "EZE": ["BUE", "AEP"],
-    "BSB": ["SAO"],
 }
 
 # Fechas a consultar: próximas N semanas (lunes de cada semana)
@@ -141,6 +140,13 @@ def destination_candidates(dest: str) -> list[str]:
     return [dest, *DEST_ALIASES.get(dest, [])]
 
 
+def stop_after_first_week_hit(dest: str) -> bool:
+    """
+    En vuelos domésticos basta con un hallazgo semanal; internacionales siguen buscando más opciones.
+    """
+    return dest in DOMESTIC_DESTS
+
+
 def candidate_depart_dates(base_monday: datetime, dest: str) -> list[str]:
     """
     Genera fechas de salida alternativas por semana para aumentar cobertura.
@@ -169,32 +175,34 @@ def search_aviasales(origin: str, dest: str, depart: str) -> list[dict]:
         return []
 
     url = "https://api.travelpayouts.com/v1/prices/cheap"
-    params = {
-        "origin":       origin,
-        "destination":  dest,
-        "depart_date":  depart,  # YYYY-MM
-        "currency":     "CLP",
-        "token":        token,
-        "limit":        5,
-    }
-    try:
-        r = SESSION.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json().get("data", {}).get(dest, {})
-        results = []
-        for flight in data.values():
-            results.append({
-                "price":    flight.get("price", 0),
-                "airline":  flight.get("airline", "?"),
-                "depart":   flight.get("departure_at", ""),
-                "return":   flight.get("return_at", ""),
-                "link":     f"https://www.aviasales.com/search/{origin}{depart.replace('-','')}{dest}1",
-                "source":   "aviasales",
-            })
-        return results
-    except Exception as e:
-        log.warning("Aviasales error %s→%s: %s", origin, dest, e)
-        return []
+    for candidate_dest in destination_candidates(dest):
+        params = {
+            "origin":       origin,
+            "destination":  candidate_dest,
+            "depart_date":  depart,  # YYYY-MM
+            "currency":     "CLP",
+            "token":        token,
+            "limit":        5,
+        }
+        try:
+            r = SESSION.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json().get("data", {}).get(candidate_dest, {})
+            results = []
+            for flight in data.values():
+                results.append({
+                    "price":    flight.get("price", 0),
+                    "airline":  flight.get("airline", "?"),
+                    "depart":   flight.get("departure_at", ""),
+                    "return":   flight.get("return_at", ""),
+                    "link":     f"https://www.aviasales.com/search/{origin}{depart.replace('-', '')}{candidate_dest}1",
+                    "source":   "aviasales",
+                })
+            if results:
+                return results
+        except Exception as e:
+            log.warning("Aviasales error %s→%s: %s", origin, candidate_dest, e)
+    return []
 
 
 def search_google_flights_serpapi(origin: str, dest: str, depart: str) -> list[dict]:
@@ -310,8 +318,8 @@ def fetch_prices(origin: str, dest: str) -> list[dict]:
                     item["queried_depart"] = depart_str
                     found_week.append(item)
 
-            # Si ya encontramos precios para esta semana, evitamos gastar más cuota/API.
-            if found_week:
+            # En rutas domésticas basta un resultado semanal; internacionales siguen buscando más cobertura.
+            if found_week and stop_after_first_week_hit(dest):
                 break
 
             time.sleep(random.uniform(1.0, 2.0))

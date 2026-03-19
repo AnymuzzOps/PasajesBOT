@@ -35,6 +35,7 @@ DATA_FILE        = Path("data/price_history.json")
 # Umbral: alerta si el precio es X% menor al promedio histórico
 ANOMALY_THRESHOLD_PCT = float(os.environ.get("ANOMALY_THRESHOLD_PCT", "35"))
 REAL_DEAL_THRESHOLD_PCT = float(os.environ.get("REAL_DEAL_THRESHOLD_PCT", "60"))
+INTERNATIONAL_REAL_DEAL_THRESHOLD_PCT = float(os.environ.get("INTERNATIONAL_REAL_DEAL_THRESHOLD_PCT", "45"))
 MIN_PRICE_CLP = 10_000
 # Fechas alternativas (días desde el lunes objetivo) para mejorar cobertura por ruta
 DATE_OFFSETS_DAYS = [0, 2, 4]
@@ -67,6 +68,14 @@ ROUTES = [
 
 DOMESTIC_DESTS = {
     "IQQ", "ARI", "ANF", "CCP", "PMC", "PUQ", "LSC",
+}
+
+DEST_ALIASES = {
+    "GRU": ["SAO"],
+    "CGH": ["SAO"],
+    "GIG": ["RIO"],
+    "EZE": ["BUE", "AEP"],
+    "BSB": ["SAO"],
 }
 
 # Fechas a consultar: próximas N semanas (lunes de cada semana)
@@ -123,6 +132,13 @@ def airline_display_name(airline: str) -> str:
     if not code:
         return "Desconocida"
     return AIRLINE_NAMES.get(code[:2], code)
+
+
+def destination_candidates(dest: str) -> list[str]:
+    """
+    Devuelve códigos alternativos de destino para mejorar cobertura internacional.
+    """
+    return [dest, *DEST_ALIASES.get(dest, [])]
 
 
 def candidate_depart_dates(base_monday: datetime, dest: str) -> list[str]:
@@ -191,33 +207,35 @@ def search_google_flights_serpapi(origin: str, dest: str, depart: str) -> list[d
         return []
 
     url = "https://serpapi.com/search"
-    params = {
-        "engine":           "google_flights",
-        "departure_id":     origin,
-        "arrival_id":       dest,
-        "outbound_date":    depart,
-        "currency":         "CLP",
-        "hl":               "es",
-        "api_key":          api_key,
-        "type":             "2",  # solo ida
-    }
-    try:
-        r = SESSION.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        best = r.json().get("best_flights", [])
-        results = []
-        for f in best[:3]:
-            results.append({
-                "price":   f.get("price", 0),
-                "airline": f["flights"][0].get("airline", "?") if f.get("flights") else "?",
-                "depart":  depart,
-                "link":    f"https://www.google.com/flights?hl=es#flt={origin}.{dest}.{depart}",
-                "source":  "google_flights",
-            })
-        return results
-    except Exception as e:
-        log.warning("SerpAPI error %s→%s: %s", origin, dest, e)
-        return []
+    for arrival_id in destination_candidates(dest):
+        params = {
+            "engine":           "google_flights",
+            "departure_id":     origin,
+            "arrival_id":       arrival_id,
+            "outbound_date":    depart,
+            "currency":         "CLP",
+            "hl":               "es",
+            "api_key":          api_key,
+            "type":             "2",  # solo ida
+        }
+        try:
+            r = SESSION.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            best = r.json().get("best_flights", [])
+            results = []
+            for f in best[:3]:
+                results.append({
+                    "price":   f.get("price", 0),
+                    "airline": f["flights"][0].get("airline", "?") if f.get("flights") else "?",
+                    "depart":  depart,
+                    "link":    f"https://www.google.com/flights?hl=es#flt={origin}.{arrival_id}.{depart}",
+                    "source":  "google_flights",
+                })
+            if results:
+                return results
+        except Exception as e:
+            log.warning("SerpAPI error %s→%s: %s", origin, arrival_id, e)
+    return []
 
 
 def search_kayak_scrape(origin: str, dest: str, depart: str) -> list[dict]:
@@ -225,33 +243,33 @@ def search_kayak_scrape(origin: str, dest: str, depart: str) -> list[dict]:
     Scraping liviano de la API pública de Kayak (no oficial, usar con respeto).
     Solo se usa si las APIs anteriores no devuelven resultados.
     """
-    # Kayak usa una URL de exploración con JSON embebido
-    url = (
-        f"https://www.kayak.cl/flights/{origin}-{dest}"
-        f"/{depart}?sort=price_a"
-    )
     headers = {
         "User-Agent": SESSION.headers["User-Agent"],
         "Accept": "text/html,application/xhtml+xml",
     }
-    try:
-        r = SESSION.get(url, headers=headers, timeout=15)
-        # Extracción básica: busca patrones de precio en el HTML
-        import re
-        prices = re.findall(r'"amount":(\d+)', r.text)
-        if not prices:
-            prices = re.findall(r'CLP\s*([\d\.]+)', r.text)
-        if prices:
-            p = int(prices[0].replace(".", ""))
-            return [{
-                "price":   p,
-                "airline": "Varios",
-                "depart":  depart,
-                "link":    url,
-                "source":  "kayak",
-            }]
-    except Exception as e:
-        log.warning("Kayak scrape error %s→%s: %s", origin, dest, e)
+    import re
+
+    for arrival_id in destination_candidates(dest):
+        url = (
+            f"https://www.kayak.cl/flights/{origin}-{arrival_id}"
+            f"/{depart}?sort=price_a"
+        )
+        try:
+            r = SESSION.get(url, headers=headers, timeout=15)
+            prices = re.findall(r'"amount":(\d+)', r.text)
+            if not prices:
+                prices = re.findall(r'CLP\s*([\d\.]+)', r.text)
+            if prices:
+                p = int(prices[0].replace(".", ""))
+                return [{
+                    "price":   p,
+                    "airline": "Varios",
+                    "depart":  depart,
+                    "link":    url,
+                    "source":  "kayak",
+                }]
+        except Exception as e:
+            log.warning("Kayak scrape error %s→%s: %s", origin, arrival_id, e)
     return []
 
 
@@ -360,16 +378,16 @@ def get_stats(history: dict, origin: str, dest: str) -> dict | None:
 # 3.  DETECCIÓN DE ANOMALÍAS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def is_anomaly(price: int, stats: dict) -> tuple[bool, float]:
+def is_anomaly(price: int, stats: dict, dest: str) -> tuple[bool, float]:
     """
     Retorna (es_anomalía, pct_descuento).
-    Para reducir falsos positivos, se alerta solo con descuento "real".
+    Usa umbrales distintos para rutas domésticas e internacionales.
     """
     mean = stats["mean"]
     pct_below = (mean - price) / mean * 100
+    threshold = REAL_DEAL_THRESHOLD_PCT if dest in DOMESTIC_DESTS else INTERNATIONAL_REAL_DEAL_THRESHOLD_PCT
 
-    # Filtro de descuento real (configurable, recomendado 60% para alertas muy agresivas)
-    if pct_below >= REAL_DEAL_THRESHOLD_PCT:
+    if pct_below >= threshold:
         return True, pct_below
 
     return False, pct_below
@@ -594,7 +612,7 @@ def main() -> None:
                 })
                 continue
 
-            anomaly, pct = is_anomaly(price, stats_before)
+            anomaly, pct = is_anomaly(price, stats_before, dest)
 
             # Guardar para resumen (todos los precios, no solo anomalías)
             best_deals.append({
